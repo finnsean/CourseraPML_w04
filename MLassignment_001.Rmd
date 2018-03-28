@@ -1,0 +1,663 @@
+---
+title: "Practical Machine Learning Week 4 Assignment"
+author: "Seán Finn"
+date: "26/8/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list=ls()) # clear workspace
+# the code in this document takes a long time to run (especially training the models). Here we define a variable which
+# allows for faster inspection of previously computed results. 
+runModeCompute <- FALSE # if FALSE, a previuosly saved workspace file is loaded, and the results are displayed using the inline R code in this deocument
+                    # if TRUE, all compuations are performed
+runModeDev <- FALSE     # if TRUE, simplified computations are performed only. Only valid when runModeCompute == TRUE
+workSpaceFileName01 <- 'MLassignment_001_LogRgstc.RData'
+workSpaceFileName02 <- 'MLassignment_002_GBM.RData'
+set.seed(42) # for reproducable results
+
+# load necessary libraries
+library(LiblineaR) # for the regLogistic classifier
+library(gbm) # for the GBM classifier
+library(ggplot2)
+library(gridExtra)
+library(plyr)
+require(reshape2)  
+library(caret)
+
+# configure multicore processing
+#library(doMC)
+#registerDoMC(cores=4)
+```
+
+```{r functionDefinitions, echo=FALSE}
+# define some usefult functions
+#----------------------------------
+# a useful function which generates a sequences of log spaced numbers
+lseq <- function(from=0, to=1, length.out=10) {
+  exp(seq(log(from), log(to), length.out = length.out))
+}
+#----------------------------------
+# a function which returns a vector of indecies of outliers exceeding a given range relative to the IQR
+findOLs <- function(x, outlierIQRscale=1.5) { 
+  #print(outlierIQRscale)
+  quants <- quantile(x, c(1,3)/4)
+  IQR <- quants[2]-quants[1]
+  olIndx <- which((x < (quants[1] - (IQR*outlierIQRscale))) | (x > (quants[2] + (IQR*outlierIQRscale))))
+}
+
+#----------------------------------
+# a function to plot the distribution of a numeric feature
+makeFeaturePlot <- function( data
+                              , featName
+                              , groupFeatName
+                              , outlierIQRscale=1.5
+                              , op_dir = NULL
+                             ) {
+  
+  gHist <- ggplot(data, aes(x=eval(as.name(featName)), fill=eval(as.name(groupFeatName))))
+  if (is.factor(data[,featName]))
+  {
+    gHist <- gHist + geom_bar(position="stack")
+  } else {
+    gHist <- gHist + geom_histogram(bins = 100,position="stack")
+  }
+  #gHist <- gHist + theme(axis.text.x = element_text(angle=90))
+  gHist <- gHist + labs(x=as.name(featName)) # axis label
+  gHist <- gHist + scale_fill_discrete(name=as.name(groupFeatName))  # legend title
+  #gHist <- gHist + facet_grid(classe ~ .)
+  gHist # display the plot so it can be saved
+  
+  # lets make a violin plot, with summary stats box plot
+  gVio <- ggplot(data, aes(y=eval(as.name(featName)), x=eval(as.name(groupFeatName))))
+  gVio <- gVio + scale_color_brewer(palette="Dark2")
+  gVio <- gVio + geom_violin(aes(fill=eval(as.name(groupFeatName))))
+  gVio <- gVio + geom_boxplot(coef=outlierIQRscale, width=0.1, outlier.colour="red", outlier.shape=1, outlier.size=1)
+  gVio <- gVio + labs(x=as.name(groupFeatName), y=as.name(featName)) # axis labels
+  gVio <- gVio + scale_fill_discrete(name=as.name(groupFeatName))  # legend title
+  gVio
+  
+  # old method is just a box plot
+  # gBox <- ggplot(train, aes(y=eval(as.name(featName)), x=classe, fill=classe))
+  # #gBox <- gBox + geom_boxplot(outlier.colour="black", outlier.shape=16, outlier.size=2, notch=TRUE)
+  # gBox <- gBox + geom_boxplot(outlier.colour="red", outlier.shape=8, outlier.size=4)
+  # gBox <- gBox + scale_color_brewer(palette="Dark2")
+  # gBox <- gBox + labs(x=as.name(featName))
+  # #gBox <- gBox + geom_jitter(shape=16, position=position_jitter(0.2))
+  # gBox
+  
+  gPlot <- arrangeGrob(gHist, gVio)
+  if (!is.null(op_dir)) {
+    plotFileName <- paste("FeatDist_", featName, ".png", sep="")
+    ggsave(file.path(op_dir, plotFileName), gPlot)
+  }
+  
+  #boxplot(train[featName])
+  grid.arrange(gHist, gVio)
+  # generate a filename for this plot
+}
+
+#----------------------------------
+# a function to plot the performannce of a regularised logistic regression fit
+#      data<-perfRegLgstc;nTr<-nTr;performanceMetricName<-performanceMetric;outDir<-NULL
+plotRegLogitPerf <- function(data,nTr,performanceMetricName="Accuracy",outDir=NULL)
+{
+  data$train <- NULL
+  data$test <- NULL
+  data$trainDifference <- NULL;
+  plotDfMelt <- melt(data, id.vars=c("cost", "type"), variable.name = "measure", value.name=performanceMetric)
+  plotTitle <- paste("Regularised_Logistic_Regression_Performance_", performanceMetric, "_DataLen_", nTr, "_Training_Samples", sep='')
+  gRegLgstc <- ggplot(plotDfMelt, aes(x=cost,y=eval(as.name(performanceMetric))) ) 
+  gRegLgstc <- gRegLgstc +  geom_line(aes(colour=measure))
+  gRegLgstc <- gRegLgstc +  geom_point() # add points at each evaluated location
+  gRegLgstc <- gRegLgstc +  facet_grid(type ~ .)
+  gRegLgstc <- gRegLgstc + labs(title=plotTitle,y=as.name(performanceMetric)) + coord_trans(x="log10")#, y="log2")
+  #gRegLgstc
+  if (!is.null(outDir)) {
+    ggsave(file.path(outDir, paste(plotTitle,".png",sep='')))
+  }
+  #print(gRegLgstc) # ensure the plot gets shown in the plots window
+  #gRegLgstc
+  grid.arrange(gRegLgstc)
+}
+#----------------------------------
+# a function to plot the performannce of a regularised logistic regression fit
+#      data<-perfGbm;nTr<-nTr;performanceMetricName<-performanceMetric;outDir<-NULL
+plotGbmPerf <- function(data,nTr,performanceMetricName="Accuracy",outDir=NULL)
+{
+  #data$cvOutsample <- NULL
+  #data$cvInsample <- NULL # lets not plot these
+  data$train <- NULL
+  data$test <- NULL
+  data$trainDifference <- NULL;
+  
+  data$interaction.depth <- as.factor(data$interaction.depth)
+  plotDfMelt <- melt(data, id.vars=c("n.trees","interaction.depth","shrinkage","n.minobsinnode"), variable.name = "measure", value.name=performanceMetric)
+  plotTitle <- paste("GBM_Performance_", performanceMetric, "_DataLen_", nTr, "_Training_Samples", sep='')
+  gGBM <- ggplot(plotDfMelt, aes(x=n.trees,y=eval(as.name(performanceMetric))) ) 
+  gGBM <- gGBM +  geom_line(aes(colour=measure))
+  #gGBM <- gGBM +  geom_point() # add points at each evaluated location
+  gGBM <- gGBM +  facet_grid(interaction.depth ~ .)
+  gGBM <- gGBM + labs(title=plotTitle,y=as.name(performanceMetric))
+  gGBM
+  if (!is.null(outDir)) {
+    ggsave(file.path(outDir, paste(plotTitle,".png",sep='')))
+  }
+  #print(gGBM) # ensure the plot gets shown in the plots window
+  #gGBM
+  grid.arrange(gGBM)
+}
+```
+
+
+## Data Analysis
+### Description, Objective & Assumptions
+The data represents multi-senor recordings of dumbbell exercise, using sensors such as gyroscopes, accelerometers, etc., attached to various positions on the body of the test subject, and on the dumbbell itself. 
+Data was obtained from the [Groupware@LES group](https://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har)
+
+The subjects attempted to perform static dumbbell curls, using the correct form (encoded as *classe* = A), and various incorrect forms (*classe* = [B,C,D,E] )
+The stated objective of this assignment is: 
+
+> ... to predict the manner in which they did the exercise. This is the "classe" variable in the training set. 
+
+The following assumptions are made:
+
+1. The objective statement above is taken to mean building a Machine Learning (ML) model which can predict the *classe* of each sample (row) of this data.
+2. In building the ML model, only measurement data from the sensors should be taken into account (i.e. the user performing the exercise, and timing-related features should be discarded). This means that the data will not be treated as a sequence of time series, e.g. each data sample will be treated individually
+3. Features with large amounts of missing values (> 90% in the training set) will be taken as coming from faulty sensors and are not considered.
+
+Source for all functions referenced in this report can be found in the markdown (.Rmd) file.
+
+### Data Exploration & Cleaning
+The data was provided in two CSV files. This is loaded and some initial exploration of the data is performed:
+```{r Load Data Saved Workspace, echo=FALSE, eval=(!runModeCompute)}
+load(workSpaceFileName01)
+load(workSpaceFileName02)
+```
+
+```{r Load Data Raw Files, echo=TRUE, eval=runModeCompute}
+dataBuildRaw1<-read.csv('pml-training.csv',header=T,na.strings=c('#DIV/0!','NA','""') ) # model building
+dataEvalRaw1<-read.csv('pml-testing.csv',header=T,na.strings=c('#DIV/0!','NA','""')) # final evaluation
+```
+Raw data contains `r ncol(dataBuildRaw1)` features: `r nrow(dataBuildRaw1)` samples for model building and `r nrow(dataEvalRaw1)` for final evaluation.
+
+### Non-training Columns
+
+The data provided contains a number of columns which are excluded from model building, with the following justifications:
+
+1. *X*: this column contains a numbering for each row
+2. *user_name*: ideally the model should be able to predict based on sensor data alone, not predicting based on the subject
+3. *raw_timestamp_part_1 and 2, cvtd_timestamp,	new_window,	num_window*: these are timing related features
+
+```{r Non training data removal, echo=TRUE}
+nonTrainingFeatures <- c("X","user_name","raw_timestamp_part_1","raw_timestamp_part_1","cvtd_timestamp","new_window","num_window")
+dataBuildRaw2 <- dataBuildRaw1[,!(colnames(dataBuildRaw1) %in% nonTrainingFeatures)]
+dataEvalRaw2 <- dataEvalRaw1[,!(colnames(dataEvalRaw1) %in% nonTrainingFeatures)]
+```
+
+### Missing Values
+A cursory glance over the data indicates some features in the data appear to have many missing values. 
+Setting a safe limit of 90% for the maximum number of missing samples for which imputation can still work, features exceeding this are discarded.
+Feature vectors which have less than 90% missing values can be imputed, but none are found:
+```{r NA removal, echo=TRUE}
+maxNAfrac <- 0.9
+countNAs <- function(x) { sum(is.na(x)) / length(x)}
+NAfractions <- vapply(dataBuildRaw1[1:ncol(dataBuildRaw1)],countNAs,FUN.VALUE=vector(length=1,mode="numeric"))
+featNamesAlmostEmpty <- colnames(dataBuildRaw1)[NAfractions > maxNAfrac] 
+featNamesReqImputation <- colnames(NAfractions)[(NAfractions > 0.0) & (NAfractions <= maxNAfrac)] 
+# remove columns which are almost empty (>90% NA)
+dataBuildRaw3<-dataBuildRaw2[!colnames(dataBuildRaw2) %in% featNamesAlmostEmpty]
+dataFinalEval<-dataEvalRaw2[!colnames(dataEvalRaw2) %in% featNamesAlmostEmpty] # also remove from eval data
+nFeats <- ncol(dataBuildRaw3)
+```
+This resulted in the removal of `r length(featNamesAlmostEmpty)` features, leaving `r nFeats` for use. There were `r length(featNamesReqImputation)` features requiring imputation (with some NA values but less than 90%).
+
+### Outliers
+
+Next the data was examined for extreme outliers, which could cause issue with some models. 
+The usual definition of an outlier is a value farther than 1.5 times the Inter Quartile Range (IQR) outside the IQR, but here *extreme outliers* are defined as those farther than 10 times the IQR.
+These samples are first identified, and the distribution of an example feature which contains such outliers is plotted:
+
+```{r Finding Outliers, echo=TRUE}
+numericFeats<-vapply(dataBuildRaw3, function(x){any(class(x) == c("numeric", "integer"))},FUN.VALUE=vector(l=1,m="logical"))
+OLindecies <- lapply(dataBuildRaw3[,numericFeats], findOLs, outlierIQRscale=10.0)
+featsWithOLs <- which(sapply(OLindecies, function(x) {length(x) > 0}))
+makeFeaturePlot(dataBuildRaw3,names(featsWithOLs[3]),"classe", outlierIQRscale=10.0) # examine one of these
+```
+
+```{r MakePlotsPreOLremoval, echo=FALSE, eval=(runModeCompute & !runModeDev)}
+# for off-line analysis, generate and all feature plots before outlier removal
+# create directories to save the histograms
+dataDir.sub <- "plots_featureHistograms_preOutlierRemoval"
+dataDir.full <- file.path(getwd(), dataDir.sub)
+dir.create(dataDir.full, showWarnings = FALSE)
+print(paste("> Data explortation plots will be saved in dir: ", dataDir.sub))
+for (ff in 1:nFeats) {
+  print(paste("> creating graph ", ff, "/", nFeats, " feature =", colnames(dataBuildRaw3[ff])))
+  makeFeaturePlot(data=dataBuildRaw3
+                  , featName=colnames(dataBuildRaw3[ff])
+                  , groupFeatName = "classe"
+                  , outlierIQRscale=10.0
+                  , op_dir=dataDir.full) 
+}
+```
+These extreme outliers are removed, and the effect of this operation on the distribution of the example feature is shown:
+
+```{r Removing Outliers, echo=TRUE}
+OLindecies<-unique(unlist(OLindecies)) # transform into a vector of unique indecies, over all features
+dataBuild<-dataBuildRaw3[-OLindecies,] # remove those outliers from the building data
+makeFeaturePlot(dataBuild,names(featsWithOLs[3]),"classe", outlierIQRscale=10.0) # examine one of these
+```
+
+```{r MakePlotsPostOLremoval, echo=FALSE, eval=(runModeCompute & !runModeDev)}
+# for off-line analysis, generate and all feature plots after outlier removal
+# create directories to save the histograms
+dataDir.sub <- "plots_featureHistograms_postOutlierRemoval"
+dataDir.full <- file.path(getwd(), dataDir.sub)
+dir.create(dataDir.full, showWarnings = FALSE)
+print(paste("> Data explortation plots will be saved in dir: ", dataDir.sub))
+for (ff in 1:length(featsWithOLs)) {
+  print(paste("> creating graph ", ff, "/", length(featsWithOLs), " feature =", names(featsWithOLs[ff])))
+  makeFeaturePlot(data=dataBuild
+                  , featName=names(featsWithOLs[ff])
+                  , groupFeatName = "classe"
+                  , outlierIQRscale=10.0
+                  , op_dir=dataDir.full) 
+}
+```
+
+Post data cleaning the data contains `r ncol(dataBuild)` features: `r nrow(dataBuild)` samples for model building and `r nrow(dataFinalEval)` for final evaluation.
+Examining the prevalence of each output class, it can be seen that there is a modest imbalance in favour of class A. Thus we will use the [kappa](https://en.wikipedia.org/wiki/Cohen's_kappa) score as a performance metric, instead of simple accuracy.
+
+```{r Prevelance, echo=TRUE}
+performanceMetric <- "Kappa"
+table(dataBuild$classe)/nrow(dataBuild)
+```
+
+## Model Development & Selection
+
+### Data Preprocessing
+
+The data were preprocessed such that each feature was normalised and scaled:
+
+```{r Preprocessing, echo=TRUE}
+ # transform all features expect the last (outcome, "classe") to mean 0 and range 1
+preProcObj <- preProcess(dataBuild[,-ncol(dataBuild)], method=c('center','scale')) 
+dataBuildPreProc <- predict(preProcObj, dataBuild) # apply to building data
+dataEvalPreProc <- predict(preProcObj, dataFinalEval) # apply the same to the validation data
+validate <- dataEvalPreProc
+```
+
+### Data Partitioning
+
+The 'building' data was split into:
+
+1. *training*, for use in building models.
+2. *testing*, for evaluating and comparing different models
+
+The final *validation* set of `r nrow(dataEvalPreProc)` samples, provided  in the file *pml-testing.csv* was applied only once to the finally selected model.
+
+```{r Sample Sizes DEV, echo=FALSE, eval=runModeDev}
+# while developing this assingment, it is often good to limit the numer of rows to in the training set for speed
+nTr <- floor(nrow(dataBuildPreProc)/10) # num samples to train with
+nTr
+fTr <- nTr/nrow(dataBuildPreProc) # as a fraction of the total training set
+iTr <- createDataPartition(y=dataBuildPreProc$class, p=fTr, list=FALSE)
+dataBuildFull <- dataBuildPreProc[iTr, ] # select the desired rows
+```
+```{r Sample Sizes, echo=FALSE, eval=(!runModeDev)}
+nTr <- nrow(dataBuildPreProc)
+dataBuildFull <- dataBuildPreProc # select the full training set
+```
+
+
+```{r Data Splitting, echo=TRUE}
+# split the full building dataset into training and validation
+trainFullIndx <- createDataPartition(y=dataBuildFull$class, p=0.7,list=FALSE)
+train <- dataBuildFull[trainFullIndx,] 
+test <- dataBuildFull[-trainFullIndx,] #c(nrow(dataBuildFull), nrow(train), nrow(test))
+```
+
+In order to evaluate fitting performance, cross validation is used.
+Within each fold, both the in and out of sample errors are evaluated.
+
+```{r CV Setup, echo=TRUE}
+nCVfolds <- 8
+CVindexList_train <- createFolds(y=train$classe, k=nCVfolds, returnTrain=T, list=T)
+```
+```{r CV Setup DEV, echo=FALSE, eval=(runModeDev)}
+nCVfolds <- 3
+CVindexList_train <- createFolds(y=train$classe, k=nCVfolds, returnTrain=T, list=T)
+```
+
+A note on madel selection strategy: for each model considered, a range of parameter values are considered.
+For each parameter value, the both in-sample and out-of-sample errors are evaluated.
+A large difference between the in-sample and out-of-sample errors is a sign of overfitting.
+
+
+### Model 1: Regularised Logistic Regression
+
+Despite its name, logistic regression can be used in classification tasks. 
+It is provided in the package [*'LiblineaR'*](https://cran.r-project.org/web/packages/LiblineaR/) .
+As one of the simpler methods, it is considered here as a first approach.
+It has a number of parameters which can be adjusted. Here a range of values for the following parameters are fitted:
+
+* cost: the trade-off between regularisation and correct classification on data. It is estimated in a data dependent fashion using the function *heuristicC()*.
+* type: the type of linear model, which is a combination of the loss functions and the regularization scheme.
+
+A full list of parameters and their descriptions can be found in the documentation of the *'LiblineaR'* package.
+
+```{r LogRegitFit Params DEV, echo=FALSE, eval=(runModeCompute && runModeDev)}
+# define a grid of the all parameter values to evaluate
+regLgstcParams_cost_n <- 3 
+regLogitParams_cost_est <- heuristicC(as.matrix(train[,-ncol(train)])) # exclude the 'classe' col
+regLgstcParams_cost_vec <- lseq(from=regLogitParams_cost_est*0.01,to=regLogitParams_cost_est*100, length.out=regLgstcParams_cost_n)
+regLgstcParams_type_vec <- c(0,2,4,6) # these are all the values supported for classification
+regLgstcParams_cost_n <- length(regLgstcParams_type_vec)
+regLgstcParams_grid <- expand.grid(cost=regLgstcParams_cost_vec,type=regLgstcParams_type_vec)
+```
+
+```{r LogRegitFit Params, echo=TRUE, eval=(runModeCompute && !runModeDev)}
+# define a grid of the all parameter values to evaluate
+regLgstcParams_cost_n <- 8 
+regLogitParams_cost_est <- heuristicC(as.matrix(train[,-ncol(train)])) # exclude the 'classe' col
+regLgstcParams_cost_vec <- lseq(from=regLogitParams_cost_est*0.01,to=regLogitParams_cost_est*100, length.out=regLgstcParams_cost_n)
+regLgstcParams_type_vec <- c(0,1,4,6,7)
+regLgstcParams_cost_n <- length(regLgstcParams_type_vec)
+regLgstcParams_grid <- expand.grid(cost=regLgstcParams_cost_vec,type=regLgstcParams_type_vec)
+```
+
+```{r LogRegitFit Fit, echo=TRUE, eval=runModeCompute}
+# create a data frame to store performance metrics for this classifier
+perfRegLgstc <- regLgstcParams_grid # contains all parameter values
+perfRegLgstc$cvInsample <- 0 # in-sample performance, estimated using cross validation
+perfRegLgstc$cvOutsample <- 0 # out-of-sample performance, estimated using cross validation
+perfRegLgstc$train <- 0 # in-sample performance, applied to the entire training set
+perfRegLgstc$test <- 0 # in-sample performance, applied to the entire test set
+modelListRegLgstc <- vector("list", nrow(regLgstcParams_grid))
+for (pp in 1:nrow(regLgstcParams_grid)) { # loop over each parameter permutation
+  perf_regLgstc_cvInSampleVec <- vector(l=nCVfolds,m="numeric") # store performance for each cv fold
+  perf_regLgstc_cvOutSampleVec <- perf_regLgstc_cvInSampleVec
+  for (ff in 1:nCVfolds) { # loop over each fold
+    print(paste("> RegLgstc param ",pp,"/",nrow(regLgstcParams_grid)," cv fold ",ff,"/",nCVfolds,sep=''))
+    cvFoldTrain <- train[CVindexList_train[[ff]],]
+    cvFoldTest <- train[-CVindexList_train[[ff]],]
+    # train model
+    modRegLgstc <- LiblineaR(data=cvFoldTrain[,-ncol(cvFoldTrain)] 
+                               , target=cvFoldTrain$classe
+                               , type =regLgstcParams_grid$type[pp]
+                               , cost=regLgstcParams_grid$cost[pp]
+                                )
+    # apply model to predict in and out of sample error for this fold
+    cvFold_trainYhat <- predict(modRegLgstc,cvFoldTrain[,-ncol(train)])$predictions
+    cvFold_testYhat <- predict(modRegLgstc,cvFoldTest[,-ncol(train)])$predictions
+    # measure & store performance for this fold
+    perf_regLgstc_cvInSampleVec[ff] <- confusionMatrix(cvFold_trainYhat,cvFoldTrain$classe)$overall[performanceMetric]
+    perf_regLgstc_cvOutSampleVec[ff] <- confusionMatrix(cvFold_testYhat,cvFoldTest$classe)$overall[performanceMetric]
+  }
+  # performance for this parameter set is the average of the cv folds
+  perfRegLgstc$cvInsample[pp] <- mean(perf_regLgstc_cvInSampleVec)
+  perfRegLgstc$cvOutsample[pp] <- mean(perf_regLgstc_cvOutSampleVec)
+  # finally, train this model on the entire training set
+  modelListRegLgstc[[pp]] <- LiblineaR(data=train[,-ncol(train)] 
+                               , target=train$classe
+                               , type =regLgstcParams_grid$type[pp]
+                               , cost=regLgstcParams_grid$cost[pp]
+                                )
+  # measure and store performance on training and test sets
+  regLgstc_trainYhat <- predict(modelListRegLgstc[[pp]],train[,-ncol(train)])$predictions
+  regLgstc_testYhat <- predict(modelListRegLgstc[[pp]],test[,-ncol(test)])$predictions
+  perfRegLgstc$train[pp] <- confusionMatrix(regLgstc_trainYhat,train$classe)$overall[performanceMetric]
+  perfRegLgstc$test[pp] <- confusionMatrix(regLgstc_testYhat,test$classe)$overall[performanceMetric]
+}
+# also measure the difference between training and test
+perfRegLgstc$trainDifference <-  perfRegLgstc$train -  perfRegLgstc$test
+```
+
+#### Performance
+
+To choose the best parameter value, the performance metrics are examined:
+
+```{r LogRegitFit Plot, echo=TRUE, eval=TRUE}
+plotRegLogitPerf(data=perfRegLgstc,nTr=nrow(train),performanceMetricName=performanceMetric)
+```
+
+```{r LogRegitFit Plot Save, echo=FALSE, eval=runModeCompute}
+# create a directory to save plots
+plotDir.sub <- "plots_modelPerformance"
+plotDir.full <- file.path(getwd(), plotDir.sub)
+dir.create(plotDir.full, showWarnings = FALSE)
+plotRegLogitPerf(data=perfRegLgstc,nTr=nTr,performanceMetricName=performanceMetric,outDir=plotDir.full)
+```
+
+It can be seen that this classifier did not perform particularly well, achieving a maximum kappa test set score of `r max(perfRegLgstc$test)`.
+A large difference in training and test scores can indicate overfitting.
+Here, the differences between training and test set scores were low (with a mean of `r mean(perfRegLgstc$trainDifference)` and a maximum of `r max(perfRegLgstc$trainDifference)`, indicating that overfitting did not occur.
+The method of optimal parameter selection was as follows: considering parameters which achieved testing performance within 5% of the overall maximum, and the parameter which gives the smallest training/test difference was chosen.
+
+```{r RegLogit Selection, echo=TRUE, eval=runModeCompute}
+consideredRange <- 0.05
+regLogit_bestParamIndx <- which( perfRegLgstc$trainDifference == 
+         min(perfRegLgstc$trainDifference[perfRegLgstc$test >= (max(perfRegLgstc$test)-consideredRange)]))
+bestRegLgstc <- modelListRegLgstc[[regLogit_bestParamIndx]]
+```
+
+Using this method, the selected Regularised Logistic Regression parameter set is (*cost = * `r perfRegLgstc[regLogit_bestParamIndx,]$cost` , *type = * `r  perfRegLgstc[regLogit_bestParamIndx,]$type`), which achieved a training kappa score of `r perfRegLgstc[regLogit_bestParamIndx,]$train` and a test kappa score of `r perfRegLgstc[regLogit_bestParamIndx,]$test`.
+
+### Model 2: Gradient Boosted Models (GBM)
+
+Gradient Boost Models are tree-based classifiers, similar in many respects to random forests.
+A key difference is that GBMs are constructed through boosting, instead of the bagging approach used in random forests.
+Implemented in the package [*'gbm'*](https://cran.r-project.org/web/packages/gbm/), there are a number of parameters which can be adjusted. Here a range of values for the following parameters were fitted:
+
+* n.trees: the number of trees to fit, also occasionally referred to as the number of iterations.
+* interaction.depth	: maximum depth of variable interactions (1 is an additive model, 2 is a model with up to 2-way interactions, etc.).
+
+Fixed values for other parameters were chosen  as follows:
+
+* n.minobsinnode: minimum number of observations in terminal nodes. Chosen equal to a fraction of the number of training samples in the rarest class.
+* distribution: 'multinomial' is appropriate for multi-class classification problems such as this.
+* shrinkage:  the learning rate or step-size reduction. The *gbm* package documentation recommends 0.001 to 0.1, here 0.05 is used.
+
+A full list of parameters and their descriptions can be found in the documentation of the *'gbm'* package.
+
+```{r GBM Params DEV, echo=FALSE, eval=(runModeCompute && runModeDev)}
+# define a grid of the all parameter values to evaluate
+gbmParams_nTreesMax <- 200 # max num trees to evaluate
+gbmParams_nTrees_n <- 10
+gbmParams_nTrees <- round(seq(from=20,to=gbmParams_nTreesMax,length.out=gbmParams_nTrees_n))
+gbmParams_interactionIdepth_n <- 4#8
+gbmParams_interactionIdepth <- round(seq(from=1,to=15, length.out=gbmParams_interactionIdepth_n))
+#gbmParams_shrinkage_n <- 2
+#gbmParams_shrinkage <- seq(from=0.05,to=0.2, length.out=gbmParams_shrinkage_n)
+gbmParams_shrinkage <- 0.05
+gbmParams_nMinobsinnode <- round(min(table(train$classe))*0.1)
+gbmParams_grid <- expand.grid(n.trees=gbmParams_nTreesMax,interaction.depth=gbmParams_interactionIdepth,shrinkage=gbmParams_shrinkage,n.minobsinnode=gbmParams_nMinobsinnode)
+gbmParams_gridPerf <- expand.grid(n.trees=gbmParams_nTrees,interaction.depth=gbmParams_interactionIdepth,shrinkage=gbmParams_shrinkage,n.minobsinnode=gbmParams_nMinobsinnode)
+```
+
+```{r GBM Params, echo=TRUE, eval=(runModeCompute && !runModeDev)}
+# define a grid of the all parameter values to evaluate
+# define a grid of the all parameter values to evaluate
+gbmParams_nTreesMax <- 250 # max num trees to evaluate
+gbmParams_nTrees_n <- 125
+gbmParams_nTrees <- round(seq(from=20,to=gbmParams_nTreesMax,length.out=gbmParams_nTrees_n))
+gbmParams_interactionIdepth_n <- 10
+gbmParams_interactionIdepth <- round(seq(from=1,to=10, length.out=gbmParams_interactionIdepth_n))
+#gbmParams_shrinkage_n <- 2
+#gbmParams_shrinkage <- seq(from=0.05,to=0.2, length.out=gbmParams_shrinkage_n)
+gbmParams_shrinkage <- 0.05
+gbmParams_nMinobsinnode <- round(min(table(train$classe))*0.1)
+gbmParams_grid <- expand.grid(n.trees=gbmParams_nTreesMax,interaction.depth=gbmParams_interactionIdepth,shrinkage=gbmParams_shrinkage,n.minobsinnode=gbmParams_nMinobsinnode)
+gbmParams_gridPerf <- expand.grid(n.trees=gbmParams_nTrees,interaction.depth=gbmParams_interactionIdepth,shrinkage=gbmParams_shrinkage,n.minobsinnode=gbmParams_nMinobsinnode)
+```
+
+```{r GBM Fit, echo=TRUE, eval=runModeCompute}
+# create a data frame to store performance metrics for this classifier
+perfGbm <- gbmParams_gridPerf # contains all parameter values, incl all iterations
+perfGbm$cvInsample <- 0 # in-sample performance, estimated using cross validation
+perfGbm$cvOutsample <- 0 # out-of-sample performance, estimated using cross validation
+perfGbm$train <- 0 # in-sample performance, applied to the entire training set
+perfGbm$test <- 0 # in-sample performance, applied to the entire test set
+modelListGbm <- vector("list", nrow(gbmParams_grid))
+gbmBestIter <- vector(mode="numeric",l=nrow(gbmParams_grid))
+for (pp in 1:nrow(gbmParams_grid)) { # loop over each parameter permutation
+  perf_gbm_cvInSampleVec <- matrix(0.0, ncol=nCVfolds,nrow=gbmParams_nTrees_n) # store performance for each cv fold
+  perf_gbm_cvOutSampleVec <- perf_gbm_cvInSampleVec
+  for (ff in 1:nCVfolds) { # loop over each fold
+    print(paste("> GBM param ",pp,"/",nrow(gbmParams_grid)," cv fold ",ff,"/",nCVfolds,sep=''))
+    cvFoldTrain <- train[CVindexList_train[[ff]],]
+    cvFoldTest <- train[-CVindexList_train[[ff]],]
+    # train model
+    modGbm <- gbm(  classe ~ .
+                  , data = cvFoldTrain  
+                  , n.trees = gbmParams_grid$n.trees[pp] 
+                  , interaction.depth = gbmParams_grid$interaction.depth[pp]
+                  , shrinkage = gbmParams_grid$shrinkage[pp] 
+                  , n.minobsinnode = gbmParams_grid$n.minobsinnode[pp] 
+                  , distribution = "multinomial"
+                  , cv.folds = 0 # just one here
+                  )
+              
+    # look at some of gbm's perfomance metrics: they estimare the best number of iterations / trees
+    #bestInter_oob <- gbm.perf(modGbm, method= "OOB")
+    for (tt in 1:length(gbmParams_nTrees)) {
+      nTrees <- gbmParams_nTrees[tt]
+      # apply model to predict in and out of sample error for this fold
+      cvFold_trainYhat <- predict(modGbm,cvFoldTrain,nTrees)
+      cvFold_testYhat <- predict(modGbm,cvFoldTest,nTrees)
+      # predict.gbm() retuns class probabilities, choose largest as predicted classes
+      cvFold_trainYhat <- as.factor(colnames(cvFold_trainYhat)[max.col(cvFold_trainYhat[,,1])]) 
+      cvFold_testYhat <- as.factor(colnames(cvFold_testYhat)[max.col(cvFold_testYhat[,,1])]) 
+      # measure & store performance for this fold
+      perf_gbm_cvInSampleVec[tt,ff] <- confusionMatrix(cvFold_trainYhat,cvFoldTrain$classe)$overall[performanceMetric]
+      perf_gbm_cvOutSampleVec[tt,ff] <- confusionMatrix(cvFold_testYhat,cvFoldTest$classe)$overall[performanceMetric]
+    }
+  }
+  # performance for this parameter set is the average of the cv folds
+  oerIndx1 <- (pp-1)*length(gbmParams_nTrees)+1
+  oerIndx2 <- (pp)*length(gbmParams_nTrees)
+  perfGbm$cvInsample[oerIndx1:oerIndx2] <- apply(perf_gbm_cvInSampleVec,1, mean)
+  perfGbm$cvOutsample[oerIndx1:oerIndx2] <- apply(perf_gbm_cvOutSampleVec,1, mean)
+  # finally, train this model on the entire training set
+  modelListGbm[[pp]] <- gbm(  classe ~ .
+                            , data = train  
+                            , n.trees = gbmParams_grid$n.trees[pp] 
+                            , interaction.depth = gbmParams_grid$interaction.depth[pp]
+                            , shrinkage = gbmParams_grid$shrinkage[pp] 
+                            , n.minobsinnode = gbmParams_grid$n.minobsinnode[pp] 
+                            , distribution = "multinomial"
+                            , cv.folds = 0 # just one here
+  )
+  # look at some of gbm's perfomance metrics: they estimare the best number of iterations / trees
+  #gbmBestIter[pp] <- gbm.perf(modelListGbm[[pp]], method="OOB")
+  for (tt in 1:length(gbmParams_nTrees)) {
+    nTrees <- gbmParams_nTrees[tt]
+    # measure and store performance on training and test sets
+    gbm_trainYhat <- predict(modelListGbm[[pp]],train,n.trees=nTrees)
+    gbm_testYhat <- predict(modelListGbm[[pp]],test,n.trees=nTrees)
+    # predict.gbm() retuns class probabilities, choose largest as predicted classes
+    gbm_trainYhat <- as.factor(colnames(gbm_trainYhat)[max.col(gbm_trainYhat[,,1])]) 
+    gbm_testYhat <- as.factor(colnames(gbm_testYhat)[max.col(gbm_testYhat[,,1])])                    
+    perfGbm$train[ (pp-1)*length(gbmParams_nTrees)+tt] <- confusionMatrix(gbm_trainYhat,train$classe)$overall[performanceMetric]
+    perfGbm$test[ (pp-1)*length(gbmParams_nTrees)+tt] <- confusionMatrix(gbm_testYhat,test$classe)$overall[performanceMetric]
+  }
+}
+# also measure the difference between training and test
+perfGbm$trainDifference <-  perfGbm$train -  perfGbm$test
+```
+
+#### Performance
+
+To choose the best parameter value, the performance metrics are examined:
+
+```{r GBM Plot, echo=TRUE, eval=TRUE}
+plotGbmPerf(data=perfGbm,nTr=nrow(train),performanceMetricName=performanceMetric)
+```
+
+```{r GBM Plot Save, echo=FALSE, eval=runModeCompute}
+plotGbmPerf(data=perfGbm,nTr=nTr,performanceMetricName=performanceMetric,outDir=plotDir.full)
+```
+
+THe GBM models were capable of achieving very good performance, achieving a maximum kappa test set score of `r max(perfGbm$test)`.
+The differences between training and test set scores are also low (with a mean of `r mean(perfGbm$trainDifference)` and a maximum of `r max(perfGbm$trainDifference)`, which indicates that overfitting did not occur.
+The same method of optimal parameter selection is used as for the Regularised Logistic Model was used (considering parameters which achieve testing performance within 5% of the overall maximum, the parameter which gives the smallest training/test difference was chosen).
+
+
+```{r GBM Selection, echo=TRUE, eval=runModeCompute}
+# find the parameter + interation with the best performance   # perfGbm[perfGbm$test >= (max(perfGbm$test)-consideredRange),]
+gbmIter_bestParamIndx <- which( perfGbm$trainDifference == 
+         min(perfGbm$trainDifference[perfGbm$test >= (max(perfGbm$test)-consideredRange)]))
+# extract the best number of iterations & number 
+gbm_bestnIter <- perfGbm$n.trees[gbmIter_bestParamIndx]
+gbm_bestParamIndx <- which(gbmParams_interactionIdepth == perfGbm$interaction.depth[gbmIter_bestParamIndx])
+bestGbm <- modelListGbm[[gbm_bestParamIndx]]
+bestGbmNiter <- gbm_bestnIter
+bestGbmInteractionDepth <- gbmParams_interactionIdepth[gbm_bestParamIndx]
+
+print(paste("Using this method, the selected GBM parmater set is n.trees = ", gbm_bestnIter, "interaction.depth = ", bestGbmInteractionDepth, ", which achieved a training kappa score of ", perfGbm$train[gbmIter_bestParamIndx], "and a test kappa score of ", perfGbm$test[gbmIter_bestParamIndx] ))
+```
+
+Using this method, the selected GBM parameter set is (*n.trees = * `r bestGbmNiter` , *interaction.depth = * `r  bestGbmInteractionDepth`), which achieved a training kappa score of `r perfGbm$train[gbmIter_bestParamIndx]` and a test kappa score of `r perfGbm$test[gbmIter_bestParamIndx]`.
+
+
+## Final Performance Evaluation
+Taking the two models evaluated, the GBM method is selected as the best performing.
+
+Having selected a model, the final step is to evaluate its performance on the 'final evaluation' dataset, provided as a separate CSV with 20 entries.
+This is provided without ground truth, so here the predicted classes are simply reported:
+```{r Final Evaluation, echo=TRUE, eval=TRUE}
+final_evalYhat <- predict(bestGbm,validate,n.trees=bestGbmNiter)
+validate$classe_pred <- as.factor(colnames(final_evalYhat)[max.col(final_evalYhat[,,1])]) #probs to class pred
+validate[c(54,55)] # print only the last two columns
+```
+
+## Conclusions & Remarks
+In this assignment the data was analysed, and extensive cleaning was performed: features with an excess of missing samples were discarded., and samples which contained extreme outliers where also discarded. 
+A regularised logistic multiclass classifier with a range of parameters was applied, but its performance was evaluated as poor regardless of the parameter values used. 
+A GBM model was also applied, and the optimal parameter set was found. 
+This demonstrated an excellent rate of performance measured both as in-sample and out-of-sample errors. The small difference introduction performance between the in-sample and out-of-sample errors demonstrates that the model is able to model the information in the data without overfitting. 
+The selected GBM model was then applied to the validation set, and the predicted values in each case were reported.
+
+```{r savedata, echo=FALSE, eval=(runModeCompute)}
+# if we actually computed the data, save the workspace to aid our future selves
+#workSpaceFileName
+save(file=workSpaceFileName01, list=c(
+  'dataBuildRaw1',
+  'dataEvalRaw1',
+  'train',
+  'test',
+  'validate',
+  'perfRegLgstc',
+  'bestRegLgstc',
+  'regLogit_bestParamIndx'#,
+  # 'perfGbm',
+  # 'bestGbm',
+  # 'bestGbmNiter',
+  # 'bestGbmInteractionDepth',
+  # 'gbm_bestParamIndx',
+  # 'gbmIter_bestParamIndx'
+  ))
+save(file=workSpaceFileName, list=c(
+  'dataBuildRaw1',
+  'dataEvalRaw1',
+  'train',
+  'test',
+  'validate',
+  'perfRegLgstc',
+  'bestRegLgstc',
+  'regLogit_bestParamIndx',
+  'perfGbm',
+  'bestGbm',
+  'bestGbmNiter',
+  'bestGbmInteractionDepth',
+  'gbm_bestParamIndx',
+  'gbmIter_bestParamIndx'
+  ))
+# TODO: complete data saving & non compute operation
+# TODO: enforce proper naming: training, test, validation
+#   fix doc structure
+
+```
+
